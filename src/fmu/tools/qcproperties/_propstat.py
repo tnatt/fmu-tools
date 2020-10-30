@@ -202,6 +202,10 @@ class PropStat:
                     )
                 codes = xtg_prop.codes.copy()
             else:
+                print(self._wells)
+                print(self._wells[0])
+                print(param)
+                print(self._wells[0].get_logrecord(param))
                 codes = self._wells[0].get_logrecord(param).copy()
 
             if self.pdata.codenames is not None and param in self.pdata.codenames:
