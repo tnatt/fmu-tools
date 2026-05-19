@@ -124,10 +124,11 @@ def _filter_to_closest_contact_cell_in_pillars(
     Filter a grid dataframe to only include the cell in each grid
     pillar (each 'IX'/'JY') that are closest to the contact.
     """
-    df = df.copy()
-    df["abs_diff"] = np.abs(df["Z_TVDSS"].values - df[contact].values)
-    min_abs_diff = df.groupby(["IX", "JY"])["abs_diff"].transform("min")
-    return df[df["abs_diff"] == min_abs_diff]
+    abs_diff = np.abs(df["Z_TVDSS"].values - df[contact].values)
+    min_abs_diff_idx = (
+        pd.Series(abs_diff, index=df.index).groupby([df["IX"], df["JY"]]).idxmin()
+    )
+    return df.loc[min_abs_diff_idx.values]
 
 
 def _filter_to_deepest_cell_above_contact_in_pillars(
@@ -140,8 +141,8 @@ def _filter_to_deepest_cell_above_contact_in_pillars(
     """
     df = df[(df[contact] > df["Z_TVDSS"]) & (df[contact] > min_value_filter)]
 
-    deepest_cell = df.groupby(["IX", "JY"])["KZ"].transform("max")
-    return df[df["KZ"] == deepest_cell]
+    deepest_cell_idx = df.groupby(["IX", "JY"])["KZ"].idxmax()
+    return df.loc[deepest_cell_idx.values]
 
 
 def _create_contact_surface(
@@ -266,11 +267,12 @@ def create_fluid_contacts_from_grid(
     df = grid_data.get_dataframe()
     surface_from_grid = grid_data.get_surface_with_grid_dimensions()
 
-    for contact in contacts:
-        print(f"Working on contact {contact.type} using parameter {contact.name}.")
-        for code, zonename in grid_data.zone_codenames.items():
-            print(f"  - processing {zonename=}.")
-            zonedf = df[df["Zone"] == code]
+    for code, zonename in grid_data.zone_codenames.items():
+        print(f"Processing {zonename=}.")
+        zonedf = df[df["Zone"] == code]
+
+        for contact in contacts:
+            print(f"  - working on contact {contact.type}.")
 
             if surf := _create_contact_surface(
                 zonedf,

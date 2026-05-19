@@ -53,7 +53,7 @@ Usage and examples
   same dimension as the grid.
 - ``grid_refinement (int)`` :  Optional refinement factor to refine the grid before
   processing to increase resolution of the output. Be aware that a high refinement factor
-  will reduce performance. Note, this does not affect the grid in RMS.
+  will reduce performance and impact memory usage. Note, this does not affect the grid in RMS.
 - ``rescale_distance (float)``: Optional target spacing used to resample contact outlines.
 
 **Examples**

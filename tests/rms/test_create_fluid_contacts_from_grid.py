@@ -123,9 +123,10 @@ def test_filter_to_closest_contact_cell_in_pillars() -> None:
     )
     filtered_df = _filter_to_closest_contact_cell_in_pillars(df, "FWL")
     assert len(filtered_df) == 2
-    # closest cell in first pillar is 100 m away from the contact
-    # closest cell in second pillar is 10 m away from the contact
-    assert list(filtered_df["abs_diff"]) == [100, 10]
+    # closest cell in first pillar is at 1100m depth
+    # closest cell in the second pillar is at 1200m depth
+    assert list(filtered_df["Z_TVDSS"]) == [1100, 1200]
+    assert list(filtered_df["FWL"]) == [1200, 1210]
 
 
 def test_filter_to_deepest_cell_above_contact_in_pillars() -> None:
