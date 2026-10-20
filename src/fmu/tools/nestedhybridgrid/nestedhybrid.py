@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import warnings
+from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, TypeAlias
 
@@ -29,6 +31,8 @@ from pydantic import BaseModel, Field, ValidationError
 if TYPE_CHECKING:
     import os
     from collections.abc import Iterable
+    from xtgeo.common.types import Dimensions
+
 
 _logger = logging.getLogger(__name__)
 
@@ -79,6 +83,71 @@ class Refinement(BaseModel):
             return cls(col=col, row=row, lay=lay)
         except ValidationError:
             raise ValueError("Refinement factors must be >= 1")
+
+
+class FaultFaceDirection(IntEnum):
+    """RMS fault face codes from RMSAPI FaceDirection.
+
+    RMSAPI values:
+    - west=0, east=1, south=2, north=3, top=4, bottom=5
+    """
+
+    WEST = 0
+    EAST = 1
+    SOUTH = 2
+    NORTH = 3
+    TOP = 4
+    BOTTOM = 5
+
+
+@dataclass(frozen=True)
+class GridFault:
+    name: str
+    fw_indices: np.ma.MaskedArray
+    hw_indices: np.ma.MaskedArray
+    fw_face: np.ma.MaskedArray
+    hw_face: np.ma.MaskedArray
+
+
+def _get_nested_fault_cells(
+    cells: np.ndarray, face: int, nested_dimensions: Dimensions
+) -> np.ndarray:
+    """Return nested flat-cell positions on a parent-cell face."""
+
+    ii, jj, kk = np.unravel_index(cells, nested_dimensions)
+
+    face_code = FaultFaceDirection(face)
+
+    if face_code is FaultFaceDirection.WEST:
+        selected = ii == ii.min()
+    elif face_code is FaultFaceDirection.EAST:
+        selected = ii == ii.max()
+    elif face_code is FaultFaceDirection.SOUTH:
+        selected = jj == jj.max()
+    elif face_code is FaultFaceDirection.NORTH:
+        selected = jj == jj.min()
+    elif face_code is FaultFaceDirection.TOP:
+        selected = kk == kk.min()
+    elif face_code is FaultFaceDirection.BOTTOM:
+        selected = kk == kk.max()
+    else:
+        raise ValueError(f"Unexpected fault face code: {face_code}")
+
+    return cells[selected]
+
+
+def _create_flat_to_rms_cell_number_mapping(grid_indexer: Any) -> np.ma.MaskedArray:
+    """Map C-order flat grid indices to RMS cell numbers."""
+    ncol, nrow, nlay = grid_indexer.dimensions
+
+    cell_numbers = grid_indexer.get_cell_numbers_in_range((0, 0, 0), (ncol, nrow, nlay))
+    i, j, k = grid_indexer.get_indices(cell_numbers).T
+
+    flat_indices = _ijk_to_flat_index(i=i, j=j, k=k, jdim=nrow, kdim=nlay)
+
+    flat_to_rms_cell_number = np.ma.masked_all(ncol * nrow * nlay, dtype=np.int64)
+    flat_to_rms_cell_number[flat_indices] = cell_numbers
+    return flat_to_rms_cell_number
 
 
 def _crop_for_region(grid: xtgeo.Grid, refinement_bbox: BoundingBox) -> xtgeo.Grid:
@@ -284,6 +353,164 @@ def _set_actnum_in_grid(grid: xtgeo.Grid, active_mask: np.ndarray) -> None:
     grid.set_actnum(actnum)
 
 
+def _ijk_to_flat_index(
+    i: np.ndarray, j: np.ndarray, k: np.ndarray, jdim: int, kdim: int
+) -> np.ndarray:
+    """Convert 0-based (i, j, k) indices to positions in a 1D flattened array.
+    This follows NumPy C-order (row-major) indexing.
+    """
+    return i * jdim * kdim + j * kdim + k
+
+
+def _group_by_parent_cell(
+    parent_indices: np.ndarray, selected_mask: np.ndarray
+) -> dict[int, np.ndarray]:
+    """
+    Group selected cell positions by parent-cell index.
+
+    Returns a mapping from parent-cell index to the positions of selected
+    cells belonging to that parent cell.
+    """
+
+    selected_parent_indices = parent_indices[selected_mask]
+    selected_mask_indices = np.flatnonzero(selected_mask)
+
+    if selected_parent_indices.size == 0:
+        return {}
+
+    # Sort so cells belonging to the same parent cell become contiguous.
+    sort_order = np.argsort(selected_parent_indices, kind="stable")
+
+    sorted_parent_indices = selected_parent_indices[sort_order]
+    sorted_selected_mask_indices = selected_mask_indices[sort_order]
+
+    # Split whenever the parent-cell index changes.
+    cuts = np.flatnonzero(np.diff(sorted_parent_indices)) + 1
+    selected_indices_by_parent_cell = np.split(sorted_selected_mask_indices, cuts)
+
+    # Get the parent-cell index for each group.
+    parent_idx_keys = sorted_parent_indices[np.r_[0, cuts]]
+
+    return dict(zip(parent_idx_keys, selected_indices_by_parent_cell))
+
+
+def _cell_numbers_to_flat_indices(
+    cell_numbers: np.ma.MaskedArray, grid_indexer: Any
+) -> np.ma.MaskedArray:
+    """Convert RMS active-cell numbers to parent-grid flat indices."""
+
+    mask = np.ma.getmaskarray(cell_numbers)
+
+    active_cell_numbers = cell_numbers[~mask].astype(np.uint64)
+    i, j, k = grid_indexer.get_indices(active_cell_numbers).T  # 0-based
+    _, nrow, nlay = grid_indexer.dimensions
+
+    flat_indices = np.ma.masked_all(cell_numbers.shape, dtype=np.int64)
+    flat_indices[~mask] = _ijk_to_flat_index(i=i, j=j, k=k, jdim=nrow, kdim=nlay)
+    return flat_indices
+
+
+def _read_grid_faults(
+    project: Any,
+    grid_name: str,
+) -> list[GridFault]:
+    """Read RMS faults and keep FW/HW parent-cell indices as masked IJK arrays."""
+    rms_grid = project.grid_models[grid_name].get_grid()
+    indexer = rms_grid.grid_indexer
+
+    faults = []
+
+    for rms_fault in rms_grid.grid_faults:
+        values = rms_fault.get_values()
+
+        fw_cells, hw_cells, fw_face, hw_face = values.T
+
+        faults.append(
+            GridFault(
+                name=rms_fault.name,
+                fw_indices=_cell_numbers_to_flat_indices(fw_cells, indexer),
+                hw_indices=_cell_numbers_to_flat_indices(hw_cells, indexer),
+                fw_face=fw_face,
+                hw_face=hw_face,
+            )
+        )
+
+    return faults
+
+
+def _write_grid_faults(
+    project: Any,
+    grid_name: str,
+    grid: xtgeo.Grid,
+    faults: list[GridFault],
+    nested_cells_by_parent: dict[int, np.ndarray],
+) -> None:
+    """Write nested-grid faults to RMS using parent-cell mapping properties."""
+    rms_grid = project.grid_models[grid_name].get_grid()
+    indexer = rms_grid.grid_indexer
+
+    # RMS fault cell numbers refer to active-cell IDs.
+    flat_to_rms_cell_number = _create_flat_to_rms_cell_number_mapping(indexer)
+
+    for fault in faults:
+        values = _map_fault_to_nested_grid(
+            fault=fault,
+            nested_cells_by_parent=nested_cells_by_parent,
+            flat_to_rms_cell_number=flat_to_rms_cell_number,
+            nested_dimensions=grid.dimensions,
+        )
+
+        rms_fault = rms_grid.grid_faults.create(fault.name)
+        rms_fault.set_values(values)
+
+
+def _map_fault_to_nested_grid(
+    fault: GridFault,
+    nested_cells_by_parent: dict[int, np.ndarray],
+    flat_to_rms_cell_number: np.ma.MaskedArray,
+    nested_dimensions: Dimensions,
+) -> np.ma.MaskedArray:
+    """Map a parent-grid fault onto nested-grid fault faces."""
+
+    rows = []
+
+    for fw_idx, hw_idx, fw_face, hw_face in zip(
+        fault.fw_indices,
+        fault.hw_indices,
+        fault.fw_face,
+        fault.hw_face,
+    ):
+        for parent_idx, face, cell_column, face_column in (
+            (fw_idx, fw_face, 0, 2),
+            (hw_idx, hw_face, 1, 3),
+        ):
+            if np.ma.is_masked(parent_idx) or np.ma.is_masked(face):
+                continue
+
+            cells = nested_cells_by_parent.get(parent_idx)
+
+            if cells is None:
+                raise ValueError(
+                    f"No nested cells found for parent cell index {parent_idx}."
+                )
+
+            nested_cells = _get_nested_fault_cells(
+                cells=cells,
+                face=face,
+                nested_dimensions=nested_dimensions,
+            )
+
+            rms_cells = flat_to_rms_cell_number[nested_cells]
+
+            side_rows = np.ma.masked_all((len(rms_cells), 4), dtype=np.uint64)
+            side_rows[:, cell_column] = rms_cells
+            side_rows[:, face_column] = face
+
+            rows.append(side_rows)
+
+    return np.ma.vstack(rows)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -309,12 +536,12 @@ class NestedHybridGrid:
         self._validate_inputs(coarse_grid, region, refinement, target_region_id)
 
         self._nnc_table: pd.DataFrame | None = None
-        self._grid: xtgeo.Grid | None = None
+        self._parent_faults: dict[str, GridFault] | None = None
 
-        self._original_grid = coarse_grid
-        self._original_dimensions = coarse_grid.dimensions
-        self._original_subgrids = coarse_grid.subgrids
-        self._original_region = region
+        self._parent_grid = coarse_grid
+        self._parent_dimensions = coarse_grid.dimensions
+        self._parent_subgrids = coarse_grid.subgrids
+        self._parent_region = region
 
         self._target_region_id = target_region_id
         self._refinement = Refinement.from_tuple(refinement)
@@ -325,6 +552,10 @@ class NestedHybridGrid:
 
         self._layer_map_coarse = self._generate_layer_map_coarse()
         self._layer_map_refined = self._generate_layer_map_refined()
+
+        self._grid = self._build_nested_hybrid_grid()
+
+        self._nested_cells_by_parent = self._create_nested_cells_by_parent()
 
     @classmethod
     def from_rms(
@@ -348,14 +579,19 @@ class NestedHybridGrid:
             target_region_id: Region value to refine (default: 1).
         """
 
-        coarse_grid = xtgeo.grid_from_roxar(project, grid_name)
+        parent_grid = xtgeo.grid_from_roxar(project, grid_name)
         region = xtgeo.gridproperty_from_roxar(project, grid_name, region_name)
 
         for propname in properties or []:
             prop = xtgeo.gridproperty_from_roxar(project, grid_name, propname)
-            coarse_grid.append_prop(prop)
+            parent_grid.append_prop(prop)
 
-        return cls(coarse_grid, region, refinement, target_region_id)
+        instance = cls(parent_grid, region, refinement, target_region_id)
+
+        instance._parent_faults = _read_grid_faults(
+            project=project, grid_name=grid_name
+        )
+        return instance
 
     def to_rms(self, project: Any, grid_name: str) -> None:
         """Write the nested hybrid grid and its properties to an RMS project."""
@@ -365,18 +601,27 @@ class NestedHybridGrid:
             if prop.name not in ORIGINAL_IJK_PROPERTY_NAMES:
                 prop.to_roxar(project, grid_name, prop.name)
 
+        if self._parent_faults is not None:
+            _write_grid_faults(
+                project=project,
+                grid_name=grid_name,
+                grid=self.grid,
+                faults=self._parent_faults,
+                nested_cells_by_parent=self._nested_cells_by_parent,
+            )
+
     @staticmethod
     def _validate_inputs(
-        coarse_grid: xtgeo.Grid,
+        parent_grid: xtgeo.Grid,
         region: xtgeo.GridProperty,
         refinement: tuple[int, int, int],
         target_region_id: int,
     ) -> None:
         """Validate input arguments."""
-        if region.dimensions != coarse_grid.dimensions:
+        if region.dimensions != parent_grid.dimensions:
             raise ValueError(
                 f"Region property dimensions {region.dimensions} do not match "
-                f"input grid dimensions {coarse_grid.dimensions}"
+                f"input grid dimensions {parent_grid.dimensions}"
             )
 
         if not (region.values == target_region_id).any():
@@ -392,11 +637,11 @@ class NestedHybridGrid:
 
     def _build_nested_hybrid_grid(self) -> xtgeo.Grid:
         """Build the nested hybrid grid."""
-        coarse_grid = self._original_grid.copy()
+        coarse_grid = self._parent_grid.copy()
 
-        region_name = self._original_region.name
+        region_name = self._parent_region.name
         if region_name not in coarse_grid.propnames:
-            coarse_grid.append_prop(self._original_region)
+            coarse_grid.append_prop(self._parent_region)
         for prop in coarse_grid.get_ijk(names=ORIGINAL_IJK_PROPERTY_NAMES):
             coarse_grid.append_prop(prop)
 
@@ -430,8 +675,6 @@ class NestedHybridGrid:
     @property
     def grid(self) -> xtgeo.Grid:
         """The final nested hybrid grid."""
-        if self._grid is None:
-            self._grid = self._build_nested_hybrid_grid()
         return self._grid
 
     @property
@@ -457,7 +700,7 @@ class NestedHybridGrid:
         return _compute_nnc_table(
             refined_area=self._refined_area,
             refinement=self._refinement,
-            coarse_ncol=self._original_dimensions.ncol,
+            coarse_ncol=self._parent_dimensions.ncol,
             lmap1=self._layer_map_coarse,
             lmap2=self._layer_map_refined,
         )
@@ -470,9 +713,9 @@ class NestedHybridGrid:
         """
         rlay = self._refinement.lay
         k0 = self._refined_bbox.kmin - 1
-        coarse_nlay = self._original_dimensions.nlay
+        parent_nlay = self._parent_dimensions.nlay
 
-        lmap = np.arange(coarse_nlay, dtype=np.int32)
+        lmap = np.arange(parent_nlay, dtype=np.int32)
         return lmap + np.where(
             lmap < k0,
             0,
@@ -495,7 +738,7 @@ class NestedHybridGrid:
 
     def _set_zonation(self, nlay: int) -> dict | None:
         """Create an updated subgrid dictionary for the merged grid."""
-        subgrid = self._original_subgrids
+        subgrid = self._parent_subgrids
         if subgrid is None:
             return None
 
@@ -515,6 +758,23 @@ class NestedHybridGrid:
             updated_subgrid[zn] = range(zmin, zmax)
 
         return updated_subgrid
+
+    def _create_nested_cells_by_parent(self) -> dict[int, np.ndarray]:
+        """Group active merged-grid cells by flattened parent-grid index."""
+        parent_i = self._grid.get_prop_by_name("parent_I")
+        parent_j = self._grid.get_prop_by_name("parent_J")
+        parent_k = self._grid.get_prop_by_name("parent_K")
+
+        parent_indices = _ijk_to_flat_index(
+            i=parent_i.values - 1,
+            j=parent_j.values - 1,
+            k=parent_k.values - 1,
+            jdim=self._parent_dimensions.nrow,
+            kdim=self._parent_dimensions.nlay,
+        )
+
+        valid = ~np.ma.getmaskarray(parent_indices)
+        return _group_by_parent_cell(parent_indices=parent_indices, selected_mask=valid)
 
 
 def create_nested_hybrid_grid(
