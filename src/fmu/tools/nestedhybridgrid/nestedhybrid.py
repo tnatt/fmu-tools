@@ -156,6 +156,38 @@ class Refinement(BaseModel):
             raise ValueError("Refinement factors must be >= 1")
 
 
+@dataclass(frozen=True)
+class GridFault:
+    name: str
+    fw_indices: np.ma.MaskedArray
+    hw_indices: np.ma.MaskedArray
+    fw_face: np.ma.MaskedArray
+    hw_face: np.ma.MaskedArray
+
+
+def _get_cell_boundary_mask(
+    ii: np.ndarray,
+    jj: np.ndarray,
+    kk: np.ndarray,
+    direction: FaceDirection,
+) -> np.ndarray:
+    """Return a boolean face-selection mask from precomputed I, J, K arrays."""
+
+    if direction == "I-":
+        return ii == ii.min()
+    if direction == "I+":
+        return ii == ii.max()
+    if direction == "J-":
+        return jj == jj.min()
+    if direction == "J+":
+        return jj == jj.max()
+    if direction == "K-":
+        return kk == kk.min()
+    if direction == "K+":
+        return kk == kk.max()
+    raise ValueError(f"Unexpected face direction: {direction}")
+
+
 def _crop_for_region(grid: xtgeo.Grid, refinement_bbox: BoundingBox) -> xtgeo.Grid:
     """Crop grid to the bounding box of the refinement region."""
 
@@ -580,6 +612,177 @@ def _create_upscaling_mappings_arrays(
     )
 
 
+def _flat_to_rms_cell_number_mapping(grid_indexer: Any) -> np.ma.MaskedArray:
+    """Map C-order flat grid indices to RMS cell numbers."""
+    ncol, nrow, nlay = grid_indexer.dimensions
+
+    cell_numbers = grid_indexer.get_cell_numbers_in_range((0, 0, 0), (ncol, nrow, nlay))
+    i, j, k = grid_indexer.get_indices(cell_numbers).T
+
+    flat_indices = _ijk_to_flat_index(i=i, j=j, k=k, jdim=nrow, kdim=nlay)
+
+    flat_to_rms_cell_number = np.ma.masked_all(ncol * nrow * nlay, dtype=np.int64)
+    flat_to_rms_cell_number[flat_indices] = cell_numbers
+    return flat_to_rms_cell_number
+
+
+def _rms_cell_numbers_to_flat_indices(
+    cell_numbers: np.ma.MaskedArray, grid_indexer: Any
+) -> np.ma.MaskedArray:
+    """Convert RMS active-cell numbers to parent-grid flat indices."""
+
+    mask = np.ma.getmaskarray(cell_numbers)
+
+    active_cell_numbers = cell_numbers[~mask].astype(np.uint64)
+    i, j, k = grid_indexer.get_indices(active_cell_numbers).T  # 0-based
+    _, nrow, nlay = grid_indexer.dimensions
+
+    flat_indices = np.ma.masked_all(cell_numbers.shape, dtype=np.int64)
+    flat_indices[~mask] = _ijk_to_flat_index(i=i, j=j, k=k, jdim=nrow, kdim=nlay)
+    return flat_indices
+
+
+def _face_direction_map(face: int) -> str:
+    return {0: "I-", 1: "I+", 2: "J+", 3: "J-", 4: "K-", 5: "K+"}[face]
+
+
+def _read_grid_faults(
+    project: Any,
+    grid_name: str,
+) -> list[GridFault]:
+    """Read RMS faults and keep FW/HW parent-cell indices as masked IJK arrays."""
+    rms_grid = project.grid_models[grid_name].get_grid()
+    indexer = rms_grid.grid_indexer
+
+    faults = []
+
+    for rms_fault in rms_grid.grid_faults:
+        values = rms_fault.get_values()
+
+        fw_cells, hw_cells, fw_face, hw_face = values.T
+
+        faults.append(
+            GridFault(
+                name=rms_fault.name,
+                fw_indices=_rms_cell_numbers_to_flat_indices(fw_cells, indexer),
+                hw_indices=_rms_cell_numbers_to_flat_indices(hw_cells, indexer),
+                fw_face=fw_face,
+                hw_face=hw_face,
+            )
+        )
+
+    return faults
+
+
+def _write_grid_faults(
+    project: Any,
+    grid_name: str,
+    grid: xtgeo.Grid,
+    faults: list[GridFault],
+    nested_cells_by_parent: CellsByParent,
+) -> None:
+    """Write nested-grid faults to RMS using parent-cell mapping properties."""
+    rms_grid = project.grid_models[grid_name].get_grid()
+    indexer = rms_grid.grid_indexer
+
+    # RMS fault cell numbers refer to active-cell IDs.
+    flat_to_rms_cell_number = _flat_to_rms_cell_number_mapping(indexer)
+
+    for fault in faults:
+        values = _map_fault_to_nested_grid(
+            fault=fault,
+            nested_cells_by_parent=nested_cells_by_parent,
+            flat_to_rms_cell_number=flat_to_rms_cell_number,
+            nested_dimensions=grid.dimensions,
+        )
+
+        rms_fault = rms_grid.grid_faults.create(fault.name)
+        rms_fault.set_values(values)
+
+
+def _map_fault_side(
+    parent_indices: np.ma.MaskedArray,
+    faces: np.ma.MaskedArray,
+    *,
+    cell_column: int,
+    face_column: int,
+    nested_cells_by_parent: CellsByParent,
+    flat_to_rms_cell_number: np.ma.MaskedArray,
+    nested_dimensions: Dimensions,
+) -> list[np.ma.MaskedArray]:
+    """Map one side of a parent-grid fault onto the nested grid."""
+    valid = ~np.ma.getmaskarray(parent_indices)
+    parent_indices = parent_indices[valid]
+    faces = faces[valid]
+
+    is_refined = nested_cells_by_parent.counts[parent_indices] > 1
+
+    rows: list[np.ma.MaskedArray] = []
+
+    # Non-refined parent cells map one-to-one to nested-grid cells.
+    if np.any(~is_refined):
+        starts = nested_cells_by_parent.group_start[parent_indices[~is_refined]]
+        nested_cells = nested_cells_by_parent.cell_indices[starts]
+        rms_cells = flat_to_rms_cell_number[nested_cells]
+
+        side_rows = np.ma.masked_all((rms_cells.size, 4), dtype=np.uint64)
+        side_rows[:, cell_column] = rms_cells
+        side_rows[:, face_column] = faces[~is_refined]
+
+        rows.append(side_rows)
+
+    # Refined parent cells expand to the nested cells on the relevant face.
+    for parent_idx, face in zip(parent_indices[is_refined], faces[is_refined]):
+        nested_cells = nested_cells_by_parent.get_indices(parent_idx)
+
+        ii, jj, kk = np.unravel_index(nested_cells, nested_dimensions)
+
+        boundary_mask = _get_cell_boundary_mask(
+            ii=ii, jj=jj, kk=kk, direction=_face_direction_map(int(face))
+        )
+
+        rms_cells = flat_to_rms_cell_number[nested_cells[boundary_mask]]
+
+        side_rows = np.ma.masked_all((rms_cells.size, 4), dtype=np.uint64)
+        side_rows[:, cell_column] = rms_cells
+        side_rows[:, face_column] = face
+
+        rows.append(side_rows)
+
+    return rows
+
+
+def _map_fault_to_nested_grid(
+    fault: GridFault,
+    nested_cells_by_parent: CellsByParent,
+    flat_to_rms_cell_number: np.ma.MaskedArray,
+    nested_dimensions: Dimensions,
+) -> np.ma.MaskedArray:
+    """Map a parent-grid fault onto nested-grid fault faces."""
+    rows: list[np.ma.MaskedArray] = []
+
+    for parent_indices, faces, cell_column, face_column in (
+        (fault.fw_indices, fault.fw_face, 0, 2),
+        (fault.hw_indices, fault.hw_face, 1, 3),
+    ):
+        rows.extend(
+            _map_fault_side(
+                parent_indices=parent_indices,
+                faces=faces,
+                cell_column=cell_column,
+                face_column=face_column,
+                nested_cells_by_parent=nested_cells_by_parent,
+                flat_to_rms_cell_number=flat_to_rms_cell_number,
+                nested_dimensions=nested_dimensions,
+            )
+        )
+
+    if not rows:
+        return np.ma.masked_all((0, 4), dtype=np.uint64)
+
+    return np.ma.vstack(rows)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -605,6 +808,7 @@ class NestedHybridGrid:
         self._validate_inputs(coarse_grid, region, refinement, target_region_id)
 
         self._nnc_table: pd.DataFrame | None = None
+        self._parent_faults: dict[str, GridFault] | None = None
 
         self._parent_grid = coarse_grid
         self._parent_dimensions = coarse_grid.dimensions
@@ -653,7 +857,12 @@ class NestedHybridGrid:
             prop = xtgeo.gridproperty_from_roxar(project, grid_name, propname)
             parent_grid.append_prop(prop)
 
-        return cls(parent_grid, region, refinement, target_region_id)
+        instance = cls(parent_grid, region, refinement, target_region_id)
+
+        instance._parent_faults = _read_grid_faults(
+            project=project, grid_name=grid_name
+        )
+        return instance
 
     def to_rms(self, project: Any, grid_name: str) -> None:
         """Write the nested hybrid grid and its properties to an RMS project."""
@@ -662,6 +871,15 @@ class NestedHybridGrid:
         for prop in self.properties:
             if prop.name not in ORIGINAL_IJK_PROPERTY_NAMES:
                 prop.to_roxar(project, grid_name, prop.name)
+
+        if self._parent_faults is not None:
+            _write_grid_faults(
+                project=project,
+                grid_name=grid_name,
+                grid=self.grid,
+                faults=self._parent_faults,
+                nested_cells_by_parent=self.nested_cells_by_parent,
+            )
 
     @staticmethod
     def _validate_inputs(
